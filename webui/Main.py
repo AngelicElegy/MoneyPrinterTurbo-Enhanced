@@ -11,7 +11,8 @@ import sys
 import tempfile
 import time
 import webbrowser
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -51,10 +52,14 @@ from app.services import (
     llm,
     loomloom,
     material,
+    media_library,
     metaso_minimax,
     muapi,
     ofox,
+    publish_board,
+    script_library,
     subtitle,
+    topic_studio,
     video,
     volcengine_seedance,
     voice,
@@ -622,6 +627,18 @@ def _save_uploaded_local_materials(uploaded_files):
                 uploaded_file.name, uploaded_file
             )
             file_path = os.path.join(local_videos_dir, stored_name)
+            # 生成页上传的素材同样要进素材库：上传接口为了安全只把文件存成 UUID，
+            # 原始文件名只写日志，不登记的话下次想复用这批素材只能重新上传。
+            # 登记失败不影响本次生成，因此单独降级处理。
+            try:
+                media_library.register_material(
+                    stored_name, original_name=uploaded_file.name
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"failed to register uploaded material in library: "
+                    f"stored_name={stored_name}, error={exc}"
+                )
             saved_paths.append(file_path)
             material_info = MaterialInfo()
             material_info.provider = "local"
@@ -762,6 +779,17 @@ def _initialize_session_state():
             loomloom.MAX_VIDEO_SCENES,
             int,
         ),
+        # 选题工坊：方案列表与选中下标只存在当前会话，不落盘。
+        "topic_studio_candidates": (),
+        "topic_studio_selected_index": 0,
+        # 跨页填表：选题工坊、脚本库都在自己的页面上把参数写进这里，再跳转到
+        # 视频生成页；由 _apply_pending_form_params() 在下一轮渲染表单控件之前
+        # 消费，避免跨页直接修改已经实例化的控件状态。
+        "pending_form_params": None,
+        # 「填入并开始生成」需要跨一次跳转传递自动开始信号。
+        "pending_form_autostart": False,
+        # 填表成功后要显示的提示文案 key，与参数一起传递。
+        "pending_form_message": "",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1514,6 +1542,31 @@ def _apply_pending_task_restore():
     return True
 
 
+def _apply_pending_form_params():
+    """
+    把其它页面选中的参数写回生成表单，返回要展示的提示文案 key。
+
+    选题工坊、脚本库都在各自的页面上把参数写进 ``pending_form_params`` 再跳转
+    过来，因此必须和「历史任务恢复」一样在渲染任何表单控件之前调用：Streamlit
+    只允许在控件实例化之前写入其 session_state。填的是全新配置，不会带上历史
+    任务的上传依赖，因此这里顺手清掉恢复流程留下的标记，避免刚填完表单就弹出
+    与本次操作无关的上传提示。
+    """
+    payload = st.session_state.pop("pending_form_params", None)
+    message_key = st.session_state.pop("pending_form_message", "")
+    if not payload:
+        # 参数已被消费时同时清掉提示，避免它在后续 rerun 里重复出现。
+        return ""
+
+    _apply_restored_params(payload)
+    st.session_state.pop("task_restore_upload_requirements", None)
+    logger.info(
+        "pending form params applied: "
+        f"subject={payload.get('video_subject', '')[:40]}"
+    )
+    return message_key
+
+
 def _apply_restored_params(params):
     """
     把一份完整的生成参数写回页面控件状态。
@@ -1935,6 +1988,22 @@ def tr_optional(key, fallback_language=""):
     return value if value else ""
 
 
+# 本轮是否已经渲染过操作反馈（成功提示）。首访引导会在同一轮脚本里调用
+# st.rerun()，把已经渲染的提示一并丢弃，因此引导启动要避开这些轮次。
+FLASH_MESSAGE_SHOWN_KEY = "ui_flash_message_shown"
+
+
+def _show_flash(message):
+    """渲染一条操作反馈，并登记「本轮已经给过反馈」。
+
+    首访引导（onboarding tour）启动时会调用 st.rerun()，同一轮里已经渲染的
+    st.success 会随这次 rerun 一起被丢掉 —— 用户看到的就是「点了按钮没有任何
+    回应」。这里留下标记，让引导推迟一轮启动，反馈才不会被吃掉。
+    """
+    st.success(message)
+    st.session_state[FLASH_MESSAGE_SHOWN_KEY] = True
+
+
 def render_onboarding_tour():
     # 引导只覆盖三个稳定入口，不尝试控制 Dialog、Tabs 或业务表单。这样既能让
     # 新用户理解完整流程，也不会把引导状态与 Streamlit 的动态组件生命周期耦合。
@@ -1989,6 +2058,11 @@ def render_onboarding_tour():
 
     # 每个 Streamlit 会话只主动启动一次。是否已经完成则由组件通过浏览器
     # localStorage 判断，避免页面 rerun 或普通控件交互反复弹出引导。
+    #
+    # 本轮已经给过操作反馈时先不启动：引导的 st.rerun() 会把同轮的提示冲掉，
+    # 用户就看不到「已填入表单」这类结果。推迟到下一次交互再弹引导。
+    if st.session_state.pop(FLASH_MESSAGE_SHOWN_KEY, False):
+        return
     auto_start_key = f"{ONBOARDING_TOUR_KEY}-auto-started"
     if not st.session_state.get(auto_start_key, False):
         st.session_state[auto_start_key] = True
@@ -4977,6 +5051,262 @@ def _render_loomloom_script_generation(params):
     _render_loomloom_candidates()
 
 
+def _topic_studio_preset_text(item, field, language):
+    """
+    读取预设文案：中文界面取中文，其它语言统一回退英文。
+
+    语言必须由调用方传入，而不是在这里读 session_state。这个函数会作为
+    selectbox 的 format_func 使用，而 format_func 可能在页面脚本之外被重新调用
+    （例如 Streamlit 测试框架重建控件状态时），此时读 session_state 会拿到与
+    渲染时不一致的语言，导致下拉框的选项标签与当前值对不上。
+    """
+    if str(language or "").startswith("zh"):
+        return item.get(field) or item.get(f"{field}_en") or ""
+    return item.get(f"{field}_en") or item.get(field) or ""
+
+
+def _topic_studio_missing_credential(style):
+    """
+    返回该画面形态当前缺少的配置项名，不缺则返回空串。
+
+    选题工坊允许「一键填入并开始生成」，因此必须在点击前就知道这个形态能不能
+    真的跑起来，而不是等任务提交后才失败。
+    """
+    config_key = style.get("requires_config_key")
+    if not config_key:
+        return ""
+    value = config.app.get(config_key, "")
+    if isinstance(value, (list, tuple)):
+        value = [item for item in value if str(item).strip()]
+    return "" if value else config_key
+
+
+def _topic_studio_current_voice():
+    """
+    读取当前页面上的音色选择，供选题工坊填充表单时原样保留。
+
+    选题工坊复用历史任务恢复的填充实现，而那段实现在缺少 voice_name 时会退回
+    「无配音」。选题工坊的目标是「画面 + 文字 + 配音」，因此必须显式把当前音色
+    带过去，否则一键生成会把用户配好的 TTS 静默关掉。
+    """
+    tts_server = (
+        st.session_state.get(localized_widget_key("tts_server_select"))
+        or config.ui.get("tts_server", "")
+    )
+    voice_name = st.session_state.get(
+        localized_widget_key(f"speech_synthesis_select_{tts_server}")
+    ) or config.ui.get("voice_name", "")
+    return str(voice_name or "")
+
+
+def _render_topic_studio():
+    """
+    渲染选题工坊：选画面形态与内容体裁 -> AI 出多套方案 -> 填入表单并跳转生成页。
+
+    选题工坊是独立页面，生成表单在视频生成页，因此这里只负责收集选择与展示
+    方案。点击填入时把参数写进 session_state 再跳转，真正的表单写入由目标页的
+    _apply_pending_topic_studio() 在渲染控件之前完成，自动开始生成由
+    _render_generation_controls() 消费，避免跨页直接修改已实例化的控件状态。
+    """
+    visual_style_ids = [item["id"] for item in topic_studio.list_visual_styles()]
+    genre_ids = [item["id"] for item in topic_studio.list_genres()]
+    # 界面语言在渲染时读一次并闭包捕获，让下面两个 format_func 成为纯粹的
+    # 值到标签的映射，不依赖调用时机。
+    ui_language = str(st.session_state.get("ui_language", "") or "")
+
+    def visual_style_label(value):
+        return _topic_studio_preset_text(
+            topic_studio.get_visual_style(value), "label", ui_language
+        )
+
+    def genre_label(value):
+        return _topic_studio_preset_text(
+            topic_studio.get_genre(value), "label", ui_language
+        )
+
+    st.subheader(tr("Topic Studio Title"))
+    st.caption(tr("Topic Studio Help"))
+
+    with st.container(border=True):
+        style_col, genre_col, count_col = st.columns([2, 2, 1])
+        with style_col:
+            style_id = stable_selectbox(
+                tr("Topic Studio Visual Style"),
+                options=visual_style_ids,
+                default_value=topic_studio.DEFAULT_VISUAL_STYLE_ID,
+                key="topic_studio_visual_style",
+                format_func=visual_style_label,
+            )
+        with genre_col:
+            genre_id = stable_selectbox(
+                tr("Topic Studio Genre"),
+                options=genre_ids,
+                default_value=topic_studio.DEFAULT_GENRE_ID,
+                key="topic_studio_genre",
+                format_func=genre_label,
+            )
+        with count_col:
+            candidate_count = st.slider(
+                tr("Topic Studio Count"),
+                min_value=topic_studio.MIN_CANDIDATE_COUNT,
+                max_value=topic_studio.MAX_CANDIDATE_COUNT,
+                value=topic_studio.DEFAULT_CANDIDATE_COUNT,
+                key="topic_studio_count",
+            )
+
+        style = topic_studio.get_visual_style(style_id)
+        genre = topic_studio.get_genre(genre_id)
+        st.caption(
+            f"{_topic_studio_preset_text(style, 'label', ui_language)}："
+            f"{_topic_studio_preset_text(style, 'description', ui_language)}  \n"
+            f"{_topic_studio_preset_text(genre, 'label', ui_language)}："
+            f"{_topic_studio_preset_text(genre, 'description', ui_language)}"
+        )
+
+        direction = st.text_input(
+            tr("Topic Studio Direction"),
+            key="topic_studio_direction",
+            max_chars=topic_studio.MAX_DIRECTION_LENGTH,
+            placeholder=tr("Topic Studio Direction Placeholder"),
+        ).strip()
+
+        generate_col, clear_col = st.columns([3, 1])
+        with generate_col:
+            generate_clicked = st.button(
+                tr("Topic Studio Generate").format(count=candidate_count),
+                key="topic_studio_generate",
+                type="secondary",
+                icon=":material/auto_awesome:",
+                use_container_width=True,
+            )
+        with clear_col:
+            clear_clicked = st.button(
+                tr("Topic Studio Clear"),
+                key="topic_studio_clear",
+                use_container_width=True,
+                disabled=not st.session_state.get("topic_studio_candidates"),
+            )
+        if clear_clicked:
+            st.session_state["topic_studio_candidates"] = ()
+            st.session_state["topic_studio_selected_index"] = 0
+            st.session_state["pending_form_params"] = None
+
+        if generate_clicked:
+            with st.spinner(tr("Topic Studio Generating")):
+                generated = _run_llm_read_operation(
+                    "generate_topic_candidates",
+                    lambda app_config_snapshot: topic_studio.generate_topic_candidates(
+                        visual_style_id=style_id,
+                        genre_id=genre_id,
+                        count=candidate_count,
+                        direction=direction,
+                        app_config=app_config_snapshot,
+                    ),
+                )
+            st.session_state["topic_studio_candidates"] = tuple(generated)
+            st.session_state["topic_studio_selected_index"] = 0
+            st.session_state["pending_form_params"] = None
+
+        candidates = tuple(st.session_state.get("topic_studio_candidates") or ())
+        if not candidates:
+            return
+
+        if all(topic_studio.is_fallback_candidate(item) for item in candidates):
+            # 模型不可用时服务层会返回占位方案。必须显式提示，否则用户可能
+            # 直接拿一条没有任何选题依据的占位内容去生成视频。
+            st.warning(tr("Topic Studio Fallback Warning"))
+
+        st.divider()
+        stored_index = st.session_state.get("topic_studio_selected_index", 0)
+        if not isinstance(stored_index, int) or not 0 <= stored_index < len(candidates):
+            # 重新生成后方案数量可能变少，先收敛下标再创建控件，避免 radio 收到
+            # 已不在选项内的旧值。
+            st.session_state["topic_studio_selected_index"] = 0
+
+        def plan_label(index):
+            # format_func 除了渲染时会被调用，也可能在控件状态重建时被再次调用，
+            # 那时下标可能已经超出当前方案数量。这里容错而不是抛异常，避免因为
+            # 一个陈旧的选中下标让整页渲染失败。
+            if isinstance(index, int) and 0 <= index < len(candidates):
+                return f"#{index + 1} {candidates[index]['title']}"
+            return str(index)
+
+        selected_index = st.radio(
+            tr("Topic Studio Choose Plan"),
+            options=list(range(len(candidates))),
+            key="topic_studio_selected_index",
+            format_func=plan_label,
+        )
+        selected = candidates[selected_index]
+
+        st.markdown(f"#### {selected['title']}")
+        st.markdown(f"> {selected['subject']}")
+        detail_columns = st.columns(3)
+        detail_columns[0].markdown(
+            f"**{tr('Topic Studio Hook')}**\n\n{selected['hook'] or '—'}"
+        )
+        detail_columns[1].markdown(
+            f"**{tr('Topic Studio Audience')}**\n\n{selected['audience'] or '—'}"
+        )
+        detail_columns[2].markdown(
+            f"**{tr('Topic Studio Why')}**\n\n{selected['why'] or '—'}"
+        )
+
+        if selected["outline"]:
+            st.markdown(f"**{tr('Topic Studio Outline')}**")
+            for step_index, step in enumerate(selected["outline"], start=1):
+                st.markdown(f"{step_index}. {step}")
+
+        st.caption(
+            f"{tr('Topic Studio Keywords')}：{'、'.join(selected['keywords']) or '—'}"
+            f"　|　{tr('Topic Studio Emotion')}：{selected['emotion']}"
+            f"　|　{tr('Topic Studio Voice Hint')}：{selected['voice_hint'] or '—'}"
+        )
+
+        missing_credential = _topic_studio_missing_credential(style)
+        needs_upload = style["video_source"] == "local"
+        if missing_credential:
+            st.warning(
+                tr("Topic Studio Missing Credential").format(
+                    style=_topic_studio_preset_text(style, "label", ui_language),
+                    key=missing_credential,
+                )
+            )
+        if needs_upload:
+            st.info(tr("Topic Studio Local Upload Required"))
+
+        fill_col, run_col = st.columns(2)
+        with fill_col:
+            fill_only = st.button(
+                tr("Topic Studio Fill Form"),
+                key="topic_studio_fill_only",
+                use_container_width=True,
+            )
+        with run_col:
+            fill_and_run = st.button(
+                tr("Topic Studio Fill And Generate"),
+                key="topic_studio_fill_and_run",
+                type="primary",
+                use_container_width=True,
+                disabled=bool(missing_credential) or needs_upload,
+            )
+
+        if fill_only or fill_and_run:
+            st.session_state["pending_form_params"] = topic_studio.build_form_params(
+                selected,
+                style_id,
+                genre_id,
+                direction,
+                voice_name=_topic_studio_current_voice(),
+            )
+            st.session_state["pending_form_autostart"] = bool(fill_and_run)
+            st.session_state["pending_form_message"] = "Topic Studio Form Filled"
+            # 表单在视频生成页，填入必须跨页完成：这里只写 session_state，
+            # 目标页会在渲染任何控件之前消费它。switch_page 只接受 st.Page
+            # 对象（callable 页面不支持按路径跳转），所以从页面登记表里取。
+            st.switch_page(_registered_page("generate"))
+
+
 def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
     with panel:
@@ -5172,6 +5502,85 @@ def _render_script_settings(panel, params):
             )
 
 
+# 生成表单里「从素材库选择」的勾选结果。存素材 ID 而不是路径，素材被删除或改名
+# 之后能自动失效，不会把一条指向不存在文件的路径带进任务参数。
+LIBRARY_MATERIAL_PICKS_KEY = "library_material_picks"
+
+
+def _library_material_options():
+    """素材库里文件仍在磁盘上的素材，供生成表单直接引用。"""
+    # 用户可能从未进过素材库页，磁盘上却已经有历史素材。这里每个会话只做一次
+    # 只新增的同步，既避免「磁盘有文件、下拉框却是空的」，也不会让生成页每次
+    # rerun 都重新扫一遍目录。
+    if not st.session_state.get("library_material_synced"):
+        media_library.sync_from_directory()
+        st.session_state["library_material_synced"] = True
+    return [item for item in media_library.list_materials() if item["exists"]]
+
+
+def _library_material_infos():
+    """把素材库勾选转换成 MaterialInfo，供生成参数使用。"""
+    infos = []
+    for material_id in st.session_state.get(LIBRARY_MATERIAL_PICKS_KEY, []) or []:
+        try:
+            material = media_library.get_material(material_id)
+        except (TypeError, ValueError):
+            material = None
+        if material is None or not material["exists"]:
+            continue
+        info = MaterialInfo()
+        info.provider = "local"
+        info.url = material["path"]
+        infos.append(info)
+    return infos
+
+
+def _render_material_library_picker():
+    """素材来源选「本地素材」时，允许直接从素材库勾选已有文件。
+
+    勾选与本次上传是并列的两个来源：上传负责「加新素材」，勾选负责「复用旧素材」，
+    两者在提交生成前合并，因此不会互相覆盖。
+    """
+    materials = _library_material_options()
+    if not materials:
+        st.caption(tr("Library Pick Empty"))
+        return
+
+    labels = {
+        item["id"]: f"{item['display_name']}（{media_library.format_size(item['size_bytes'])}）"
+        for item in materials
+    }
+    options = [item["id"] for item in materials]
+    valid = set(options)
+
+    # 素材被删除后 session 里可能残留已经不存在的 ID。必须在下拉框实例化之前
+    # 收敛掉，否则控件会拿到一个不在选项里的旧值。
+    current = st.session_state.get(LIBRARY_MATERIAL_PICKS_KEY)
+    if current is None:
+        st.session_state[LIBRARY_MATERIAL_PICKS_KEY] = []
+    else:
+        filtered = [item for item in current if item in valid]
+        if filtered != list(current):
+            st.session_state[LIBRARY_MATERIAL_PICKS_KEY] = filtered
+
+    selected = st.multiselect(
+        tr("Library Pick Existing"),
+        options=options,
+        format_func=lambda value, labels=labels: labels.get(value, str(value)),
+        key=LIBRARY_MATERIAL_PICKS_KEY,
+        help=tr("Library Pick Help"),
+    )
+    if selected:
+        total = sum(
+            item["size_bytes"] for item in materials if item["id"] in set(selected)
+        )
+        st.caption(
+            tr("Library Pick Summary").format(
+                count=len(selected), size=media_library.format_size(total)
+            )
+        )
+
+
 def _render_video_settings(panel, params):
     """渲染视频设置并返回本次选择的本地素材。"""
     uploaded_files = []
@@ -5245,6 +5654,7 @@ def _render_video_settings(panel, params):
                     accept_multiple_files=True,
                     key="local_video_materials_uploader",
                 )
+                _render_material_library_picker()
 
             # 文案顺序匹配会从关键词生成到最终合成全程保持叙事顺序，因此开启时
             # 顺序拼接是唯一符合实际执行逻辑的选项。同步控件值可避免界面仍显示
@@ -7949,7 +8359,9 @@ def _render_generation_controls(
         "task_restore_upload_requirements", {}
     )
     has_local_materials = bool(
-        uploaded_files or st.session_state.get("local_video_materials", [])
+        uploaded_files
+        or st.session_state.get("local_video_materials", [])
+        or st.session_state.get(LIBRARY_MATERIAL_PICKS_KEY, [])
     )
     has_custom_audio = bool(uploaded_audio_file)
     unmet_restore_requirements = _get_unmet_restore_upload_requirements(
@@ -7971,12 +8383,21 @@ def _render_generation_controls(
 
     _render_settings_transfer(params)
 
-    start_button = st.button(
-        tr("Generate Video"),
-        use_container_width=True,
-        type="primary",
-        key="generate_video_button",
-        on_click=_prepare_generation_task,
+    # 选题工坊 / 脚本库的「填入并开始生成」不经过按钮回调，这里补上同样的任务
+    # 登记，让自动开始与手动点击共用完全一致的校验和提交流程。
+    pending_form_autostart = bool(st.session_state.pop("pending_form_autostart", False))
+    if pending_form_autostart:
+        _prepare_generation_task()
+
+    start_button = (
+        st.button(
+            tr("Generate Video"),
+            use_container_width=True,
+            type="primary",
+            key="generate_video_button",
+            on_click=_prepare_generation_task,
+        )
+        or pending_form_autostart
     )
     render_onboarding_tour()
     if start_button:
@@ -8308,6 +8729,13 @@ def _render_generation_controls(
                 if m.url:
                     params.video_materials.append(m)
 
+        if params.video_source == "local":
+            # 素材库勾选与本次上传并列：上传是「加新素材」，勾选是「复用旧素材」，
+            # 两者不互斥，因此统一在这里追加，而不是让其中一个覆盖另一个。
+            library_infos = _library_material_infos()
+            if library_infos:
+                params.video_materials = list(params.video_materials or []) + library_infos
+
         reusable_voice_preview = _get_reusable_full_voice_preview(
             params,
             voice_mode,
@@ -8367,6 +8795,1799 @@ def _render_generation_controls(
     return start_button
 
 
+# -----------------------------------------------------------------------------
+# 发布台账：全局导航、视频记录与账号管理
+# -----------------------------------------------------------------------------
+
+
+def _publish_board_platform_labels(ui_language):
+    """预计算平台展示名，供控件的 format_func 使用。
+
+    format_func 会在控件状态重建时被再次调用，那一刻可能已经不在脚本上下文
+    里，读取 st.session_state 会直接抛错。这里先把翻译结果算成普通字典，
+    format_func 只做一次纯查表。
+    """
+    return {
+        item["id"]: publish_board.platform_label(item["id"], ui_language)
+        for item in publish_board.PLATFORMS
+    }
+
+
+def _seed_widget_state(key, value):
+    """仅在控件首次创建时写入默认值，之后完全交给 Streamlit 管理状态。
+
+    每次 rerun 都无条件赋值会让用户的输入被数据库里的旧值反复覆盖，
+    因此这里必须保留 ``setdefault`` 语义。
+    """
+    if key not in st.session_state:
+        st.session_state[key] = value
+    return st.session_state[key]
+
+
+def _confirm_destructive_action(key, on_confirm, label, confirm_label, hint=None):
+    """两段式删除：先点删除，再确认，避免误触清掉数据。
+
+    发布台账、账号管理、素材库都复用这一套交互，``hint`` 允许各页面给出更贴合
+    场景的确认提示（例如素材被任务引用时）。
+
+    「待确认」标志位必须放在 ``{key}_pending`` 这个独立 key 上，不能直接拿按钮自身
+    的 key 当标志位：进入确认态的那一轮脚本里删除按钮不再被实例化，Streamlit 收尾
+    时会把它当成陈旧控件状态清掉，下一轮（用户点确认）读到的就是空值，于是重新渲染
+    出「删除」按钮、确认点击被丢弃 —— 表现就是点了确认没反应。
+
+    这里统一用 ``scope="app"`` 重跑：删除入口现在都在弹窗里，而弹窗是 fragment，
+    默认的 fragment 级重跑刷不到弹窗背后的表格，记录删掉了列表还显示着。
+    """
+    pending_key = f"{key}_pending"
+    if st.session_state.get(pending_key):
+        st.warning(hint or tr("Board Confirm Delete Hint"))
+        confirm_col, cancel_col = st.columns([1, 1])
+        if confirm_col.button(
+            confirm_label, key=f"{key}_confirm", type="primary", width="stretch"
+        ):
+            st.session_state.pop(pending_key, None)
+            on_confirm()
+            st.rerun(scope="app")
+        if cancel_col.button(tr("Cancel"), key=f"{key}_cancel", width="stretch"):
+            st.session_state.pop(pending_key, None)
+            st.rerun(scope="app")
+        return
+
+    if st.button(label, key=key, width="stretch"):
+        st.session_state[pending_key] = True
+        st.rerun(scope="app")
+
+
+# -----------------------------------------------------------------------------
+# 记录列表的通用形态：表格 + 详情弹窗
+# -----------------------------------------------------------------------------
+# 素材库 / 脚本库 / 发布管理 / 账号管理都是「一批同构记录 + 逐条维护」。卡片式一屏
+# 只放得下两三条，字段一多就得上下滚；统一改成表格看全貌、点行开弹窗改细节。
+
+# 表格的行选中属于控件自身状态。弹窗关掉后如果不清掉它，下一轮又会因为「这一行
+# 还选着」而立刻把弹窗重新弹开，所以关闭时递增代号，让表格换一个新 key ——
+# 新控件天然没有选中项。
+_RECORD_TABLE_EPOCH_KEY = "record_table_epoch"
+
+
+def _close_record_dialog():
+    """弹窗关闭回调：丢掉表格的行选中，避免弹窗自己弹回来。"""
+    st.session_state[_RECORD_TABLE_EPOCH_KEY] = (
+        st.session_state.get(_RECORD_TABLE_EPOCH_KEY, 0) + 1
+    )
+
+
+def _render_record_table(name, rows, column_config, *, caption=None, height=None):
+    """渲染记录表格，返回被选中行在 ``rows`` 里的下标；没有选中返回 ``None``。
+
+    ``rows`` 是「每行一个 dict」的列表，``column_config`` 里用
+    ``st.column_config.*`` 描述每列的展示方式（表头文案、宽度、缩略图等）。
+    """
+    if caption:
+        st.caption(caption)
+    epoch = st.session_state.get(_RECORD_TABLE_EPOCH_KEY, 0)
+    # height=None 在这个 Streamlit 版本会直接抛错，只在给了具体值时才传。
+    size_kwargs = {"height": height} if height is not None else {}
+    event = st.dataframe(
+        rows,
+        key=f"{name}_record_table_{epoch}",
+        on_select="rerun",
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        column_order=list(column_config),
+        column_config=column_config,
+        **size_kwargs,
+    )
+    selected = list(getattr(getattr(event, "selection", None), "rows", None) or [])
+    if not selected:
+        return None
+    index = int(selected[0])
+    return index if 0 <= index < len(rows) else None
+
+
+def _render_record_table_hint():
+    """表格上方的一行操作提示：告诉用户「点一行就能打开详情」。"""
+    st.caption(tr("Record Table Hint"))
+
+
+def _close_dialog_button(key):
+    """弹窗里的「关闭」按钮：关掉弹窗并清掉表格行选中。"""
+    if st.button(tr("Close"), key=key, width="stretch"):
+        _close_record_dialog()
+        st.rerun(scope="app")
+
+
+# -----------------------------------------------------------------------------
+# 标准中后台表格：发布管理 / 账号管理 / 素材库 / 脚本库共用一套骨架
+# -----------------------------------------------------------------------------
+# 原来的 ``_render_record_table`` 是「点行开详情」一行式表格；现在按
+# 标准管理平台的形态重做：上方一条工具栏（新增 / 搜索 / 筛选 / 批量操作），
+# 中间表格区有复选框列 + 数据列 + 操作列，底部带分页。四个管理页都改用
+# ``_render_admin_table``，配置改成传 dataclass/可调用对象的形式，
+# 避免每个页面再重复写一遍 checkbox / 分页 / 批量按钮的样板代码。
+
+@dataclass(frozen=True)
+class AdminColumn:
+    """admin_table 的列定义。
+
+    ``ratio`` 是相对宽度（与其它列、复选框列、操作列一起做 ``st.columns``）。
+    ``render`` 可选；不传则直接 ``str(record[col.key])``。
+    ``image`` 为 True 时值会被当成图片 data URI 渲染；空值显示占位。
+    """
+
+    key: str
+    label: str
+    ratio: float
+    render: Callable[[dict], object] | None = None
+    image: bool = False
+
+
+@dataclass(frozen=True)
+class AdminRowAction:
+    """admin_table 每行的操作按钮（编辑、删除等）。
+
+    ``callback(record)`` 在按钮被点击的那一轮同步执行（on_click 形式），
+    里面要 ``st.rerun(scope="app")`` 才会让列表刷新。
+    """
+
+    key: str
+    label: str
+    callback: Callable[[dict], None]
+    icon: str | None = None
+    button_type: str = "secondary"  # "primary" | "secondary" | "tertiary"
+
+
+@dataclass(frozen=True)
+class AdminBulkAction:
+    """admin_table 选中后启用的批量操作按钮。
+
+    ``label`` 里可以含 ``{count}`` 占位符，渲染时替换成当前选中条数。
+    ``callback(records)`` 接收被选中的原始记录列表。
+    """
+
+    key: str
+    label: str
+    callback: Callable[[list], None]
+    icon: str | None = None
+    button_type: str = "secondary"
+
+
+@dataclass(frozen=True)
+class AdminFilter:
+    """admin_table 工具栏里的筛选下拉。
+
+    渲染成 ``selectbox``，选项来自 ``options``，``format_func`` 与
+    ``stable_selectbox`` 一致；筛选值落在 ``key`` 上，由调用方读取并
+    重新过滤 ``records`` 后再调用本组件。
+    """
+
+    label: str
+    options: Sequence
+    default: object
+    key: str
+    format_func: Callable[[object], str] | None = None
+
+
+def _toggle_admin_selection(name, idx):
+    """复选框回调：把 idx 加入/移出当前选中集合。
+
+    选中集合是 ``records`` 的下标列表，存在 ``st.session_state``
+    的 ``f"{name}_admin_selected"`` 里。回调必须用 on_change 形式触发，
+    直接在 checkbox 后 ``if value: ...`` 写修改是无效的：Streamlit
+    会先读控件状态再跑页面逻辑，等页面代码看到值时已经晚了。
+    """
+    selected = st.session_state.setdefault(f"{name}_admin_selected", [])
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+
+def _clear_admin_selection(name):
+    """清掉 admin_table 的选中集合（批量操作完成后调用）。"""
+    st.session_state[f"{name}_admin_selected"] = []
+
+
+def _prune_admin_selection(name, total):
+    """把超出 records 范围的过期下标清掉，避免列表变短后残留无效选中。"""
+    selected_key = f"{name}_admin_selected"
+    selected = [
+        idx for idx in st.session_state.get(selected_key, [])
+        if isinstance(idx, int) and 0 <= idx < total
+    ]
+    if selected != st.session_state.get(selected_key, []):
+        st.session_state[selected_key] = selected
+    return selected
+
+
+def _set_admin_del_pending(name, idx):
+    """设置 admin_table 当前「行内删除待确认」的目标下标。"""
+
+    st.session_state[f"{name}_admin_del_pending"] = idx
+
+
+def _clear_admin_del_pending(name):
+    """清掉 admin_table 的「行内删除待确认」标志。"""
+
+    st.session_state.pop(f"{name}_admin_del_pending", None)
+
+
+def _render_admin_table(
+    name,
+    records,
+    columns,
+    *,
+    row_actions=(),
+    bulk_actions=(),
+    page_size=10,
+    add_label=None,
+    add_callback=None,
+    toolbar_search_label=None,
+    toolbar_search_key=None,
+    toolbar_filters=(),
+    empty_message=None,
+    total_label=None,
+    page_label=None,
+):
+    """渲染标准中后台表格：工具栏 + 数据行 + 分页栏。
+
+    状态约定（全部存在 ``st.session_state`` 里）：
+    - 选中下标集合 ``f"{name}_admin_selected"``
+    - 当前页码 ``f"{name}_admin_page"``
+    - 行内删除待确认下标 ``f"{name}_admin_del_pending"``
+    - 工具栏搜索框 key 由 ``toolbar_search_key`` 指定
+    - 工具栏筛选下拉 key 由各 ``AdminFilter.key`` 指定
+
+    行内删除约定：``row_actions`` 里 ``key == "_admin_delete"`` 的按钮被点后
+    会先进入「行内待确认」态（同行的按钮变成 ✓确认 + ✗取消），需要再点 ✓ 才
+    执行 ``callback``。其他 ``row_actions`` 是直接 on_click 触发的图标按钮。
+
+    调用方负责：
+    - 自己读 toolbar_search_key / 各 filter key，把过滤后的 ``records`` 传进来
+    - add_callback / row callback / bulk callback 完成后自己 ``st.rerun(scope="app")``
+    """
+    selection_key = f"{name}_admin_selected"
+    page_key = f"{name}_admin_page"
+    del_pending_key = f"{name}_admin_del_pending"
+    del_pending_idx = st.session_state.get(del_pending_key)
+    if not isinstance(del_pending_idx, int) or del_pending_idx < 0 or del_pending_idx >= len(records):
+        if del_pending_idx is not None:
+            st.session_state.pop(del_pending_key, None)
+        del_pending_idx = None
+
+    # 操作列里有一个特殊的 "_admin_delete"：它会进"行内待确认"态，
+    # 按钮从 1 个变成 2 个（✓确认 + ✗取消）。操作列宽度始终按
+    # ``len(row_actions) + 1`` 预留，避免态切换时整行宽度跳变。
+    n_action_slots = max(len(row_actions), 1) + 1
+    action_ratio = max(1.8, 0.95 * n_action_slots)
+
+    # --- 工具栏：新增 + 搜索 + 筛选 + 批量 ---
+    # 搜索/筛选放在工具栏内以体现"标准管理后台"形态：所有交互平铺在一行，
+    # 窄屏下由 st.container(horizontal=True) 自动换行。
+    # 这里只负责渲染；调用方负责读搜索/筛选 key 后过滤 records 再重画。
+    with st.container(
+        key=f"{name}_admin_toolbar",
+        horizontal=True,
+        gap="small",
+        vertical_alignment="center",
+    ):
+        if add_label and add_callback:
+            if st.button(
+                add_label,
+                key=f"{name}_admin_add",
+                type="primary",
+                icon=":material/add:",
+                width="content",
+            ):
+                add_callback()
+                st.rerun(scope="app")
+        if toolbar_search_label and toolbar_search_key:
+            st.text_input(
+                toolbar_search_label,
+                key=toolbar_search_key,
+                placeholder=tr("Admin Search Placeholder"),
+                label_visibility="collapsed",
+            )
+        for filter_spec in toolbar_filters:
+            current = st.session_state.get(filter_spec.key, filter_spec.default)
+            # format_func 必须绑默认参数，避免按引用捕获多个筛选共用同一个
+            # labels 字典导致显示错位（这个坑在主表单里踩过）。
+            if filter_spec.format_func is None:
+
+                def format_func(value, opts=filter_spec.options):
+                    if isinstance(opts, dict):
+                        return opts.get(value, value)
+                    return str(value)
+
+            else:
+
+                def format_func(value, fn=filter_spec.format_func):
+                    return fn(value)
+
+            stable_selectbox(
+                filter_spec.label,
+                options=list(filter_spec.options),
+                default_value=current,
+                key=filter_spec.key,
+                format_func=format_func,
+                label_visibility="collapsed",
+            )
+        # 批量按钮和搜索/筛选平铺在工具栏里；选中条数为 0 时禁用，UI
+        # 上立即给反馈，避免点完发现没反应。
+        selected_now = _prune_admin_selection(name, len(records))
+        for bulk in bulk_actions:
+            label = (
+                bulk.label.format(count=len(selected_now))
+                if "{count}" in bulk.label
+                else bulk.label
+            )
+            if st.button(
+                label,
+                key=f"{name}_admin_bulk_{bulk.key}",
+                icon=bulk.icon,
+                type=bulk.button_type,
+                disabled=not selected_now,
+                width="content",
+            ):
+                bulk.callback([records[i] for i in selected_now])
+                _clear_admin_selection(name)
+                st.rerun(scope="app")
+
+    # --- 表头 ---
+    col_ratios = [0.55] + [c.ratio for c in columns] + ([action_ratio] if row_actions else [])
+    header_cols = st.columns(col_ratios, vertical_alignment="center", gap="small")
+    # 复选框列表头：用一个零宽字符撑住列宽，让表头和数据列对齐
+    header_cols[0].markdown(
+        "&nbsp;",
+        help=tr("Admin Selection Help"),
+    )
+    for i, col_def in enumerate(columns):
+        header_cols[i + 1].markdown(f"**{col_def.label}**")
+    if row_actions:
+        header_cols[-1].markdown(f"**{tr('Admin Col Action')}**")
+
+    if not records:
+        if empty_message:
+            st.info(empty_message)
+        return
+
+    # --- 分页 ---
+    total = len(records)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = st.session_state.get(page_key, 0)
+    if not isinstance(page, int) or page < 0 or page >= total_pages:
+        page = 0
+    start = page * page_size
+    end = min(total, start + page_size)
+    page_records = records[start:end]
+
+    # --- 数据行 ---
+    for offset, record in enumerate(page_records):
+        global_idx = start + offset
+        row_cols = st.columns(col_ratios, vertical_alignment="center", gap="small")
+        with row_cols[0]:
+            # 零宽空格作为占位 label：label_visibility="collapsed" 会隐藏，
+            # 但 label 不能完全为空（Streamlit 1.59 会打 a11y warning）。
+            st.checkbox(
+                "\u200b",
+                value=global_idx in st.session_state.get(selection_key, []),
+                key=f"{name}_admin_chk_{global_idx}",
+                on_change=_toggle_admin_selection,
+                args=(name, global_idx),
+                label_visibility="collapsed",
+            )
+        for i, col_def in enumerate(columns):
+            value = col_def.render(record) if col_def.render else record.get(col_def.key, "")
+            if col_def.image:
+                if value:
+                    # 缩略图固定 64px 宽，避免在大列表里把列撑爆；
+                    # data URI 直接透传，绕开 /media/ 500。
+                    row_cols[i + 1].image(value, width=64)
+                else:
+                    row_cols[i + 1].caption("—")
+            else:
+                text = "" if value is None else str(value)
+                row_cols[i + 1].write(text)
+        if row_actions:
+            with row_cols[-1]:
+                with st.container(horizontal=True, gap="small"):
+                    if del_pending_idx == global_idx:
+                        # 待确认态：渲染 ✓确认 + ✗取消 两个按钮。
+                        # ✓按钮直接走 action.callback（删除），✗按钮清掉标志位。
+                        for action in row_actions:
+                            if action.key == "_admin_delete":
+                                st.button(
+                                    "✓",
+                                    key=f"{name}_admin_del_ok_{global_idx}",
+                                    type="primary",
+                                    help=action.label,
+                                    on_click=action.callback,
+                                    args=(record,),
+                                )
+                        st.button(
+                            "✗",
+                            key=f"{name}_admin_del_cancel_{global_idx}",
+                            help=tr("Cancel"),
+                            on_click=_clear_admin_del_pending,
+                            args=(name,),
+                        )
+                    else:
+                        for action in row_actions:
+                            if action.key == "_admin_delete":
+                                st.button(
+                                    action.label,
+                                    key=f"{name}_admin_act__admin_delete_{global_idx}",
+                                    icon=action.icon,
+                                    type=action.button_type,
+                                    on_click=_set_admin_del_pending,
+                                    args=(name, global_idx),
+                                )
+                            else:
+                                st.button(
+                                    action.label,
+                                    key=f"{name}_admin_act_{action.key}_{global_idx}",
+                                    icon=action.icon,
+                                    type=action.button_type,
+                                    on_click=action.callback,
+                                    args=(record,),
+                                )
+
+    # --- 分页栏 ---
+    pag_cols = st.columns([2.5, 2.5, 1, 1], vertical_alignment="center", gap="small")
+    if total_label:
+        pag_cols[0].caption(total_label.format(start=start + 1, end=end, total=total))
+    if page_label:
+        pag_cols[1].caption(page_label.format(current=page + 1, total=total_pages))
+    with pag_cols[2]:
+        if st.button(
+            tr("Admin Prev Page"),
+            key=f"{name}_admin_prev",
+            disabled=page == 0,
+            width="stretch",
+        ):
+            st.session_state[page_key] = page - 1
+            st.rerun(scope="app")
+    with pag_cols[3]:
+        if st.button(
+            tr("Admin Next Page"),
+            key=f"{name}_admin_next",
+            disabled=page >= total_pages - 1,
+            width="stretch",
+        ):
+            st.session_state[page_key] = page + 1
+            st.rerun(scope="app")
+
+
+def _video_platform_tag_text(video, platform_labels):
+    """表格「平台标记」列：没打标记时给一个明确的占位文案。"""
+    platforms = list(video["platforms"])
+    return " · ".join(
+        platform_labels.get(item, item) for item in platforms
+    ) or tr("Board No Platform Tag")
+
+
+def _video_table_rows(videos, platform_labels):
+    """把发布台账整理成表格数据。"""
+    rows = []
+    for video in videos:
+        rows.append(
+            {
+                "subject": video["subject"],
+                "platforms": _video_platform_tag_text(video, platform_labels),
+                "bindings": len(video["bindings"]),
+                "origin": tr("Board Origin Auto")
+                if video["origin"] == publish_board.ORIGIN_AUTO
+                else tr("Board Origin Manual"),
+                "generated_at": str(video.get("generated_at") or "")
+                .replace("T", " ")[:16],
+                "video_size": f"{video['video_size'] / 1024 / 1024:.1f} MB"
+                if video.get("video_size")
+                else "",
+                "remark": video["remark"],
+            }
+        )
+    return rows
+
+
+@st.dialog(tr("Board Add Title"), width="medium", on_dismiss=_close_record_dialog)
+def _video_create_dialog():
+    """新增视频记录弹窗：填主题 / 路径 / 备注，提交即入库。"""
+    subject_key = "pb_create_dialog_subject"
+    _seed_widget_state(subject_key, "")
+    subject = st.text_input(
+        tr("Board Video Subject"), key=subject_key, max_chars=publish_board.MAX_SUBJECT_LENGTH
+    )
+    path_key = "pb_create_dialog_path"
+    _seed_widget_state(path_key, "")
+    path = st.text_input(
+        tr("Board Video Path"),
+        key=path_key,
+        placeholder=tr("Board Video Path Placeholder"),
+        max_chars=publish_board.MAX_URL_LENGTH,
+    )
+    remark_key = "pb_create_dialog_remark"
+    _seed_widget_state(remark_key, "")
+    remark = st.text_area(
+        tr("Board Remark"), key=remark_key, height=70, max_chars=publish_board.MAX_REMARK_LENGTH
+    )
+    action_cols = st.columns([1, 1])
+    if action_cols[0].button(
+        tr("Board Add Video Submit"), type="primary", width="stretch",
+        key="pb_create_dialog_submit",
+    ):
+        if not subject.strip():
+            st.error(tr("Board Subject Required"))
+        else:
+            publish_board.create_video(
+                subject=subject, video_path=path, remark=remark,
+            )
+            _show_flash(tr("Board Video Added"))
+            st.rerun(scope="app")
+    action_cols[1].button(
+        tr("Cancel"), width="stretch", key="pb_create_dialog_cancel",
+    )
+
+
+@st.dialog(tr("Board Detail Title"), width="large", on_dismiss=_close_record_dialog)
+def _video_detail_dialog(video, accounts, platform_labels, ui_language):
+    """视频记录详情弹窗：平台标记、账号绑定、备注与删除。"""
+    video_id = video["id"]
+    platforms = list(video["platforms"])
+    bindings = video["bindings"]
+
+    meta_parts = [
+        tr("Board Origin Auto")
+        if video["origin"] == publish_board.ORIGIN_AUTO
+        else tr("Board Origin Manual")
+    ]
+    if video.get("generated_at"):
+        meta_parts.append(video["generated_at"].replace("T", " "))
+    if video.get("video_size"):
+        meta_parts.append(f"{video['video_size'] / 1024 / 1024:.1f} MB")
+    if video.get("task_id"):
+        meta_parts.append(video["task_id"])
+    st.caption("　·　".join(meta_parts))
+
+    subject_key = f"pb_subject_{video_id}"
+    _seed_widget_state(subject_key, video["subject"])
+    subject = st.text_input(
+        tr("Board Video Subject"), key=subject_key, max_chars=publish_board.MAX_SUBJECT_LENGTH
+    )
+
+    platforms_key = f"pb_platforms_{video_id}"
+    _seed_widget_state(platforms_key, platforms)
+    selected_platforms = st.multiselect(
+        tr("Board Platform Tags"),
+        options=list(publish_board.PLATFORM_IDS),
+        format_func=lambda platform_id: platform_labels.get(platform_id, platform_id),
+        key=platforms_key,
+        help=tr("Board Platform Tags Help"),
+    )
+    # 平台标记变化时立即落库；取消标记会由数据层级联撤销对应绑定，
+    # 不需要在这里额外维护一致性。
+    if list(selected_platforms) != platforms:
+        publish_board.set_video_platforms(video_id, selected_platforms)
+        bindings = {
+            key: value for key, value in bindings.items() if key in selected_platforms
+        }
+
+    for platform_id in selected_platforms:
+        platform_accounts = [item for item in accounts if item["platform"] == platform_id]
+        current_binding = bindings.get(platform_id) or {}
+        label_col, account_col, url_col = st.columns([1.0, 2.2, 2.4])
+        label_col.markdown(f"**{platform_labels.get(platform_id, platform_id)}**")
+
+        if not platform_accounts:
+            account_col.caption(tr("Board No Account For Platform"))
+            continue
+
+        account_options = [0] + [item["id"] for item in platform_accounts]
+        account_labels = {0: tr("Board Unbound")}
+        account_labels.update(
+            {item["id"]: item["account_name"] for item in platform_accounts}
+        )
+        current_account = int(current_binding.get("account_id") or 0)
+        if current_account not in account_options:
+            # 账号被删除、或账号改了平台之后，历史绑定可能指向一个不属于
+            # 当前平台列表的 ID。此时必须回落到「未绑定」，否则控件会拿到
+            # 一个非法选项，界面上显示成空值。
+            current_account = 0
+        selected_account = stable_selectbox(
+            tr("Board Bound Account"),
+            options=account_options,
+            default_value=current_account,
+            key=f"pb_account_{video_id}_{platform_id}",
+            # 闭包必须把 labels 绑成默认参数。format_func 会被 Streamlit 在
+            # 控件状态重建时再次调用，而循环里的 account_labels 每轮都会重新
+            # 赋值，按引用捕获会让所有下拉框最终共用最后一次迭代的字典。
+            format_func=lambda account_id, labels=account_labels: labels.get(
+                account_id, str(account_id)
+            ),
+            label_visibility="collapsed",
+        )
+        url_key = f"pb_url_{video_id}_{platform_id}"
+        _seed_widget_state(url_key, current_binding.get("video_url", ""))
+        work_url = url_col.text_input(
+            tr("Board Work Url"),
+            key=url_key,
+            label_visibility="collapsed",
+            placeholder=tr("Board Work Url Placeholder"),
+            max_chars=publish_board.MAX_URL_LENGTH,
+        )
+
+        if selected_account != current_account:
+            if selected_account:
+                publish_board.bind_account(
+                    video_id, platform_id, selected_account, work_url
+                )
+            else:
+                publish_board.unbind_account(video_id, platform_id)
+            bindings[platform_id] = {
+                "account_id": selected_account,
+                "video_url": work_url,
+            }
+        elif work_url != (current_binding.get("video_url") or ""):
+            if current_account:
+                publish_board.bind_account(
+                    video_id, platform_id, current_account, work_url
+                )
+
+    remark_key = f"pb_remark_{video_id}"
+    _seed_widget_state(remark_key, video["remark"])
+    remark = st.text_area(
+        tr("Board Remark"),
+        key=remark_key,
+        max_chars=publish_board.MAX_REMARK_LENGTH,
+        height=70,
+    )
+
+    # 文本类字段统一在值变化时落库，省掉「改完忘了点保存」的经典问题。
+    updates = {}
+    if subject.strip() and subject.strip() != video["subject"]:
+        updates["subject"] = subject
+    if remark != video["remark"]:
+        updates["remark"] = remark
+    if updates:
+        publish_board.update_video(video_id, **updates)
+
+    if video.get("video_path") and os.path.isfile(video["video_path"]):
+        if st.button(tr("Board Preview Video"), key=f"pb_preview_{video_id}"):
+            preview_key = "pb_preview_target"
+            st.session_state[preview_key] = (
+                "" if st.session_state.get(preview_key) else video["video_path"]
+            )
+            st.rerun()
+        if st.session_state.get("pb_preview_target") == video["video_path"]:
+            st.video(video["video_path"])
+
+    _confirm_destructive_action(
+        f"pb_delete_video_{video_id}",
+        lambda: publish_board.delete_video(video_id),
+        tr("Board Delete Video"),
+        tr("Board Confirm Delete Video"),
+    )
+    _close_dialog_button(f"pb_detail_close_{video_id}")
+
+
+def _render_publish_board_page():
+    """发布管理页：列出生成过的视频，维护平台标记与账号绑定。"""
+    _render_top_bar()
+
+    ui_language = st.session_state.get("ui_language", config.ui.get("language", "zh"))
+    platform_labels = _publish_board_platform_labels(ui_language)
+
+    st.subheader(tr("Publish Board Title"))
+    st.caption(tr("Publish Board Help"))
+
+    # 每次进入页面都把 storage/tasks 下新产出的成片补进台账，让列表始终跟得上
+    # 实际产物；同步只新增不覆盖，不会冲掉手工维护的标记和备注。
+    sync_stats = publish_board.sync_from_tasks()
+    stats = publish_board.summary()
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(tr("Board Stat Videos"), stats["videos"])
+    metric_cols[1].metric(tr("Board Stat Accounts"), stats["accounts"])
+    metric_cols[2].metric(tr("Board Stat Bindings"), stats["bindings"])
+    metric_cols[3].metric(tr("Board Stat New Synced"), sync_stats["added"])
+
+    accounts = publish_board.list_accounts()
+
+    # 搜索 / 平台筛选 / 来源筛选都搬到 admin_table 工具栏里，调用方只负责
+    # 把过滤结果喂给表格。关键 key 全部本地化（跟原实现保持一致）。
+    search_key = localized_widget_key("pb_admin_search")
+    platform_filter_key = localized_widget_key("pb_admin_platform")
+    origin_filter_key = localized_widget_key("pb_admin_origin")
+    keyword = st.session_state.get(search_key, "")
+    platform_filter = st.session_state.get(platform_filter_key, "")
+    origin_filter = st.session_state.get(origin_filter_key, "")
+
+    # 翻译文案必须在创建控件之前算好：format_func 会在控件状态重建时被再次
+    # 调用，那一刻不在脚本上下文里，读 st.session_state 会直接抛错。
+    all_filter_label = tr("Board Filter All")
+    origin_labels = {
+        "": all_filter_label,
+        publish_board.ORIGIN_AUTO: tr("Board Origin Auto"),
+        publish_board.ORIGIN_MANUAL: tr("Board Origin Manual"),
+    }
+
+    videos = publish_board.list_videos(
+        keyword=keyword, platform=platform_filter, origin=origin_filter
+    )
+    rows = _video_table_rows(videos, platform_labels)
+    # 把原始 video 一并放进行 dict，给"编辑/删除"回调回传用。
+    for row, video in zip(rows, videos):
+        row["record"] = video
+
+    def _edit_video(row):
+        _video_detail_dialog(
+            row["record"], accounts, platform_labels, ui_language
+        )
+
+    def _delete_video(row):
+        publish_board.delete_video(row["record"]["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_videos(selected_rows):
+        for row in selected_rows:
+            try:
+                publish_board.delete_video(row["record"]["id"])
+            except Exception as error:  # noqa: BLE001
+                st.session_state.setdefault(
+                    "pb_admin_bulk_skipped", []
+                ).append(row["record"]["subject"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
+        "pb",
+        rows,
+        [
+            AdminColumn(
+                key="subject",
+                label=tr("Board Col Subject"),
+                ratio=2.5,
+            ),
+            AdminColumn(
+                key="platforms",
+                label=tr("Board Col Platforms"),
+                ratio=1.5,
+            ),
+            AdminColumn(
+                key="bindings",
+                label=tr("Board Col Bindings"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="origin",
+                label=tr("Board Col Origin"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="generated_at",
+                label=tr("Board Col Generated"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="video_size",
+                label=tr("Board Col Size"),
+                ratio=0.8,
+            ),
+            AdminColumn(
+                key="remark",
+                label=tr("Board Col Remark"),
+                ratio=1.8,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Board Edit Video"),
+                icon=":material/edit:",
+                callback=_edit_video,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Board Delete Video"),
+                icon=":material/delete:",
+                callback=_delete_video,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_videos,
+            ),
+        ],
+        add_label=tr("Board Add New"),
+        add_callback=lambda: _video_create_dialog(),
+        toolbar_search_label=tr("Board Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Board Filter Platform"),
+                options=[""] + list(publish_board.PLATFORM_IDS),
+                default="",
+                key=platform_filter_key,
+                format_func=lambda pid, labels=platform_labels, fallback=all_filter_label: (
+                    fallback if pid == "" else labels.get(pid, pid)
+                ),
+            ),
+            AdminFilter(
+                label=tr("Board Filter Origin"),
+                options=["", publish_board.ORIGIN_AUTO, publish_board.ORIGIN_MANUAL],
+                default="",
+                key=origin_filter_key,
+                format_func=lambda origin, labels=origin_labels: labels.get(origin, origin),
+            ),
+        ],
+        empty_message=tr("Board No Videos"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
+    )
+
+    if st.session_state.pop("pb_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
+
+
+def _render_accounts_page():
+    """账号管理页：维护平台、账号名、账号 ID、主页链接与备注。"""
+    _render_top_bar()
+
+    ui_language = st.session_state.get("ui_language", config.ui.get("language", "zh"))
+    platform_labels = _publish_board_platform_labels(ui_language)
+
+    st.subheader(tr("Accounts Title"))
+    st.caption(tr("Accounts Help"))
+
+    accounts = publish_board.list_accounts()
+    stats = publish_board.summary()
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(tr("Board Stat Accounts"), stats["accounts"])
+    metric_cols[1].metric(tr("Board Stat Bindings"), stats["bindings"])
+    metric_cols[2].metric(tr("Account Col Platform"), len(platform_labels))
+    metric_cols[3].metric(tr("Account Col Bindings"), sum(
+        publish_board.count_account_bindings(account["id"]) for account in accounts
+    ))
+
+    # 搜索 / 平台筛选 / 新增都在 admin_table 工具栏里，组件只负责渲染，
+    # 这里把过滤 + 列表渲染 + 操作回调串起来。
+    search_key = localized_widget_key("ac_admin_search")
+    platform_filter_key = localized_widget_key("ac_admin_platform")
+    keyword = st.session_state.get(search_key, "")
+    platform_filter = st.session_state.get(platform_filter_key, "")
+    if keyword:
+        lowered = keyword.lower()
+        accounts = [
+            account for account in accounts
+            if any(
+                lowered in (account.get(field) or "").lower()
+                for field in ("account_name", "account_id", "remark")
+            )
+        ]
+    if platform_filter:
+        accounts = [account for account in accounts if account["platform"] == platform_filter]
+
+    all_platforms_label = tr("Account Filter All Platforms")
+    rows = [
+        {
+            **account,
+            "platform_label": platform_labels.get(
+                account["platform"], account["platform"]
+            ),
+            "bindings_count": publish_board.count_account_bindings(account["id"]),
+        }
+        for account in accounts
+    ]
+
+    def _edit_account(record):
+        _account_detail_dialog(record, platform_labels)
+
+    def _delete_account(record):
+        # 行内两段式触发的是 _admin_delete 按钮的 ✓ 回调，这里直接落库；
+        # 失败时 publish_board 会抛 ValueError，admin_table 不再额外处理。
+        publish_board.delete_account(record["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_accounts(selected_rows):
+        for record in selected_rows:
+            try:
+                publish_board.delete_account(record["id"])
+            except ValueError:
+                # 已被绑定过的账号不能删，与单行删除保持一致：跳过被阻止的项，
+                # 不让整批失败；记录到 session_state 留给上层展示。
+                st.session_state.setdefault(
+                    "ac_admin_bulk_skipped", []
+                ).append(record["account_name"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
+        "ac",
+        rows,
+        [
+            AdminColumn(
+                key="platform_label",
+                label=tr("Account Col Platform"),
+                ratio=0.9,
+            ),
+            AdminColumn(
+                key="account_name",
+                label=tr("Account Col Name"),
+                ratio=1.6,
+            ),
+            AdminColumn(
+                key="account_id",
+                label=tr("Account Col Uid"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="profile_url",
+                label=tr("Account Col Url"),
+                ratio=1.6,
+                render=lambda r: f"[link]({r['profile_url']})" if r.get("profile_url") else "—",
+            ),
+            AdminColumn(
+                key="remark",
+                label=tr("Account Col Remark"),
+                ratio=2.0,
+            ),
+            AdminColumn(
+                key="bindings_count",
+                label=tr("Account Col Bindings"),
+                ratio=0.7,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Account Edit"),
+                icon=":material/edit:",
+                callback=_edit_account,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Account Delete"),
+                icon=":material/delete:",
+                callback=_delete_account,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_accounts,
+            ),
+        ],
+        add_label=tr("Account Add New"),
+        add_callback=lambda: _account_create_dialog(platform_labels),
+        toolbar_search_label=tr("Account Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Account Col Platform"),
+                options=[""] + list(publish_board.PLATFORM_IDS),
+                default="",
+                key=platform_filter_key,
+                format_func=lambda pid, labels=platform_labels, fallback=all_platforms_label:
+                    fallback if pid == "" else labels.get(pid, pid),
+            ),
+        ],
+        empty_message=tr("Account No Accounts"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
+    )
+
+    if st.session_state.pop("ac_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
+
+
+@st.dialog(tr("Account Detail Title"), width="large", on_dismiss=_close_record_dialog)
+def _account_detail_dialog(account, platform_labels):
+    """账号详情弹窗：改平台/账号名/账号 ID/主页/备注，或删除账号。"""
+    account_id = account["id"]
+    bound_count = publish_board.count_account_bindings(account_id)
+    if bound_count:
+        st.caption(tr("Account Published Count").format(count=bound_count))
+
+    edit_cols = st.columns([1.0, 1.6, 1.4])
+    platform_key = f"pb_acc_platform_{account_id}"
+    _seed_widget_state(platform_key, account["platform"])
+    platform_value = edit_cols[0].selectbox(
+        tr("Account Platform"),
+        options=list(publish_board.PLATFORM_IDS),
+        format_func=lambda platform_id: platform_labels.get(platform_id, platform_id),
+        key=platform_key,
+    )
+    name_key = f"pb_acc_name_{account_id}"
+    _seed_widget_state(name_key, account["account_name"])
+    name_value = edit_cols[1].text_input(
+        tr("Account Name"), key=name_key, max_chars=publish_board.MAX_ACCOUNT_NAME_LENGTH
+    )
+    uid_key = f"pb_acc_uid_{account_id}"
+    _seed_widget_state(uid_key, account["account_id"])
+    uid_value = edit_cols[2].text_input(
+        tr("Account ID"), key=uid_key, max_chars=publish_board.MAX_ACCOUNT_ID_LENGTH
+    )
+
+    url_key = f"pb_acc_url_{account_id}"
+    _seed_widget_state(url_key, account["profile_url"])
+    url_value = st.text_input(
+        tr("Account Profile Url"), key=url_key, max_chars=publish_board.MAX_URL_LENGTH
+    )
+    remark_key = f"pb_acc_remark_{account_id}"
+    _seed_widget_state(remark_key, account["remark"])
+    remark_value = st.text_area(
+        tr("Account Remark"),
+        key=remark_key,
+        height=70,
+        max_chars=publish_board.MAX_REMARK_LENGTH,
+    )
+
+    changes = {}
+    if platform_value != account["platform"]:
+        changes["platform"] = platform_value
+    if name_value.strip() and name_value.strip() != account["account_name"]:
+        changes["account_name"] = name_value
+    if uid_value != account["account_id"]:
+        changes["account_id"] = uid_value
+    if url_value != account["profile_url"]:
+        changes["profile_url"] = url_value
+    if remark_value != account["remark"]:
+        changes["remark"] = remark_value
+
+    if changes:
+        # 换平台后原有的绑定会与新平台冲突，数据层按平台校验，这里先
+        # 给出明确提示而不是静默失败。
+        if "platform" in changes and bound_count:
+            st.warning(tr("Account Platform Change Warning").format(count=bound_count))
+        try:
+            publish_board.update_account(account_id, **changes)
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success(tr("Account Updated"))
+
+    if bound_count:
+        st.caption(tr("Account Bound Warning").format(count=bound_count))
+    _confirm_destructive_action(
+        f"pb_delete_account_{account_id}",
+        lambda account_id=account_id: publish_board.delete_account(account_id),
+        tr("Account Delete"),
+        tr("Account Confirm Delete"),
+    )
+    _close_dialog_button(f"ac_detail_close_{account_id}")
+
+
+@st.dialog(tr("Account Add Title"), width="medium", on_dismiss=_close_record_dialog)
+def _account_create_dialog(platform_labels):
+    """新增账号弹窗：填平台/账号名/账号 ID/主页/备注，提交即入库。"""
+    platform_key = "ac_create_dialog_platform"
+    _seed_widget_state(platform_key, publish_board.PLATFORM_IDS[0])
+    platform_value = st.selectbox(
+        tr("Account Platform"),
+        options=list(publish_board.PLATFORM_IDS),
+        format_func=lambda platform_id: platform_labels.get(platform_id, platform_id),
+        key=platform_key,
+    )
+    name_key = "ac_create_dialog_name"
+    _seed_widget_state(name_key, "")
+    name_value = st.text_input(
+        tr("Account Name"), key=name_key, max_chars=publish_board.MAX_ACCOUNT_NAME_LENGTH
+    )
+    uid_key = "ac_create_dialog_uid"
+    _seed_widget_state(uid_key, "")
+    uid_value = st.text_input(
+        tr("Account ID"), key=uid_key, max_chars=publish_board.MAX_ACCOUNT_ID_LENGTH
+    )
+    url_key = "ac_create_dialog_url"
+    _seed_widget_state(url_key, "")
+    url_value = st.text_input(
+        tr("Account Profile Url"), key=url_key, max_chars=publish_board.MAX_URL_LENGTH
+    )
+    remark_key = "ac_create_dialog_remark"
+    _seed_widget_state(remark_key, "")
+    remark_value = st.text_area(
+        tr("Account Remark"), key=remark_key, height=70, max_chars=publish_board.MAX_REMARK_LENGTH
+    )
+    action_cols = st.columns([1, 1])
+    if action_cols[0].button(
+        tr("Account Add Submit"), type="primary", width="stretch",
+        key="ac_create_dialog_submit",
+    ):
+        try:
+            publish_board.create_account(
+                platform=platform_value,
+                account_name=name_value,
+                account_id=uid_value,
+                profile_url=url_value,
+                remark=remark_value,
+            )
+        except ValueError as error:
+            st.error(
+                tr("Account Name Required") if "name" in str(error) else str(error)
+            )
+        else:
+            # 通知列表刷新；弹窗本身由 on_dismiss 关掉时会清掉行选中。
+            _show_flash(tr("Account Added"))
+            st.rerun(scope="app")
+    action_cols[1].button(
+        tr("Cancel"), width="stretch", key="ac_create_dialog_cancel",
+    )
+
+
+# -----------------------------------------------------------------------------
+# 素材库与脚本库：把生成过程中沉淀下来的本地素材和文案管理起来
+# -----------------------------------------------------------------------------
+
+# 缩略图要读原图重编码，一屏几百条时首次进入会明显变慢。表格本身能放下全部记录，
+# 这里只限制「为多少行生成预览」，其余行留空，靠搜索/筛选缩小范围。
+LIBRARY_PREVIEW_LIMIT = 60
+
+
+def _material_meta_text(material, ui_language):
+    """素材的一行元信息：类型 · 尺寸 · 时长 · 体积 · 入库时间。"""
+    parts = [media_library.kind_label(material["kind"], ui_language)]
+    if material["width"] and material["height"]:
+        parts.append(f"{material['width']}×{material['height']}")
+    duration = media_library.format_duration(material["duration"])
+    if duration:
+        parts.append(duration)
+    parts.append(media_library.format_size(material["size_bytes"]))
+    parts.append(str(material["created_at"]).replace("T", " ")[:16])
+    return "　·　".join(parts)
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _material_preview_uri(stored_name, stamp, path, kind, max_side=None):
+    """素材预览图（base64 data URI）。
+
+    预览要读原图并重编码，属于纯 IO/CPU 活，按 ``(stored_name, stamp)`` 缓存：
+    素材文件被替换或重新上传后 stamp 变化，缓存自动失效。生成失败返回空串，
+    由调用方降级成文字提示，不影响其余操作。
+
+    ``max_side`` 为 ``None`` 时用详情弹窗那一档（大图）；表格单元格传
+    ``LIST_THUMBNAIL_MAX_SIDE``，两者各缓存一份。
+    """
+    if max_side is None:
+        return media_library.preview_data_uri(path, kind)
+    return media_library.preview_data_uri(path, kind, max_side=max_side)
+
+
+def _save_library_uploads(uploaded_files):
+    """把素材库页上传的文件落盘并登记，返回（成功条目, 失败描述列表）。
+
+    上传接口为了安全只用 UUID 落盘，原始文件名只写日志；素材库必须在这里显式
+    登记，否则文件进库后依然认不出是谁。
+    """
+    saved = []
+    failures = []
+    for uploaded_file in uploaded_files:
+        try:
+            stored_name = material_upload_service.save_material_upload(
+                uploaded_file.name, uploaded_file
+            )
+            saved.append(
+                media_library.register_material(
+                    stored_name, original_name=uploaded_file.name
+                )
+            )
+        except (
+            material_upload_service.MaterialUploadError,
+            material_upload_service.MaterialServiceError,
+            OSError,
+        ) as error:
+            failures.append(f"{uploaded_file.name}: {error}")
+    return saved, failures
+
+
+def _material_spec_text(material):
+    """表格「规格」列：图片给尺寸，视频给尺寸+时长，都没有就留空。"""
+    parts = []
+    if material["width"] and material["height"]:
+        parts.append(f"{material['width']}×{material['height']}")
+    duration = media_library.format_duration(material["duration"])
+    if duration:
+        parts.append(duration)
+    return "　·　".join(parts)
+
+
+def _material_table_rows(materials, ui_language):
+    """把素材列表整理成表格数据。
+
+    预览列走内联缩略图（``st.image`` 对 ``data:`` 字符串直接透传，绕开当前
+    Streamlit + Starlette 组合下必然 500 的 ``/media/`` 端点，详见
+    ``media_library.preview_data_uri``）。缩略图要读原图重编码，因此只给前
+    ``LIBRARY_PREVIEW_LIMIT`` 行生成，其余留空，靠搜索/筛选缩小范围再看；
+    列表用 ``LIST_THUMBNAIL_MAX_SIDE`` 那一档小图，避免表格载荷被撑大。
+    """
+    rows = []
+    for index, material in enumerate(materials):
+        preview = ""
+        if material["exists"] and index < LIBRARY_PREVIEW_LIMIT:
+            preview = _material_preview_uri(
+                material["stored_name"],
+                f"{material['size_bytes']}-{material['updated_at']}",
+                material["path"],
+                material["kind"],
+                media_library.LIST_THUMBNAIL_MAX_SIDE,
+            )
+        rows.append(
+            {
+                "preview": preview,
+                "name": material["display_name"],
+                "kind": media_library.kind_label(material["kind"], ui_language),
+                "spec": _material_spec_text(material),
+                "size": media_library.format_size(material["size_bytes"]),
+                "status": (
+                    tr("Library Status Ok")
+                    if material["exists"]
+                    else tr("Library Status Missing")
+                ),
+                "created_at": str(material["created_at"]).replace("T", " ")[:16],
+                "remark": material["remark"],
+                "record": material,
+            }
+        )
+    return rows
+
+
+@st.dialog(tr("Library Detail Title"), width="large", on_dismiss=_close_record_dialog)
+def _material_detail_dialog(material, ui_language):
+    """素材详情弹窗：预览、改名/备注（改完即落库）、存储路径与删除。"""
+    material_id = material["id"]
+
+    if not material["exists"]:
+        st.warning(tr("Library File Missing"))
+    else:
+        preview_uri = _material_preview_uri(
+            material["stored_name"],
+            f"{material['size_bytes']}-{material['updated_at']}",
+            material["path"],
+            material["kind"],
+        )
+        if preview_uri:
+            # 缩略图最大边只有 480，铺满弹窗会糊，固定按像素宽展示。
+            st.image(preview_uri, width=360)
+        else:
+            st.caption(tr("Library Preview Failed"))
+
+    name_key = f"ml_name_{material_id}"
+    _seed_widget_state(name_key, material["original_name"])
+    name = st.text_input(
+        tr("Library Material Name"),
+        key=name_key,
+        max_chars=media_library.MAX_ORIGINAL_NAME_LENGTH,
+        placeholder=material["display_name"],
+    )
+    remark_key = f"ml_remark_{material_id}"
+    _seed_widget_state(remark_key, material["remark"])
+    remark = st.text_input(
+        tr("Library Material Remark"),
+        key=remark_key,
+        max_chars=media_library.MAX_REMARK_LENGTH,
+    )
+
+    st.caption(_material_meta_text(material, ui_language))
+    # st.code 自带复制按钮，路径就是要「下次直接引用」的那个地址。
+    st.code(material["path"], language=None)
+
+    updates = {}
+    if name.strip() != material["original_name"]:
+        updates["original_name"] = name.strip()
+    if remark != material["remark"]:
+        updates["remark"] = remark
+    if updates:
+        media_library.update_material(material_id, **updates)
+
+    delete_key = f"ml_delete_{material_id}"
+    hint = None
+    if st.session_state.get(f"{delete_key}_pending"):
+        # 引用扫描要读历史任务目录，只在真正准备删除时才算。
+        references = media_library.count_references(material["stored_name"])
+        if references:
+            subjects = "、".join(
+                (item["subject"] or item["task_id"])[:20] for item in references[:3]
+            )
+            hint = tr("Library Delete Referenced").format(
+                count=len(references), subjects=subjects
+            )
+    _confirm_destructive_action(
+        delete_key,
+        lambda material_id=material_id: media_library.delete_material(material_id),
+        tr("Library Delete"),
+        tr("Library Confirm Delete"),
+        hint=hint,
+    )
+    _close_dialog_button(f"ml_detail_close_{material_id}")
+
+
+def _render_media_library_page():
+    """素材库页：管理本地上传的图片与视频素材，供生成时直接引用。"""
+    _render_top_bar()
+
+    if st.session_state.get("settings_dialog_open", False):
+        _render_settings_dialog()
+
+    ui_language = st.session_state.get("ui_language", config.ui.get("language", "zh"))
+
+    st.subheader(tr("Media Library Title"))
+    st.caption(tr("Media Library Help"))
+
+    # 上传接口与 WebUI 都可能先落文件、后登记（历史文件、手工拷进来的文件），
+    # 因此每次进入页面都做一次只新增的同步，让列表跟得上磁盘现状。
+    media_library.sync_from_directory()
+    st.session_state["library_material_synced"] = True
+    stats = media_library.summary()
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(tr("Library Stat Materials"), stats["materials"])
+    metric_cols[1].metric(tr("Library Stat Images"), stats["images"])
+    metric_cols[2].metric(tr("Library Stat Videos"), stats["videos"])
+    metric_cols[3].metric(tr("Library Stat Size"), media_library.format_size(stats["bytes"]))
+
+    # 上传是素材库的核心入口；file_uploader 不便塞进 dialog / 工具栏按钮，
+    # 这里继续保留 expander 区块。其余搜索/筛选/批量操作都搬到 admin_table。
+    with st.expander(tr("Library Upload"), expanded=False):
+        uploaded_files = st.file_uploader(
+            tr("Library Upload"),
+            type=[
+                extension.removeprefix(".")
+                for extension in sorted(LOCAL_MATERIAL_EXTENSIONS)
+            ],
+            accept_multiple_files=True,
+            key="library_uploader",
+            help=tr("Library Upload Help"),
+        )
+        if st.button(
+            tr("Library Upload Submit"), key="library_upload_submit", type="primary"
+        ):
+            if not uploaded_files:
+                st.warning(tr("Library Upload Empty"))
+            else:
+                saved, failures = _save_library_uploads(uploaded_files)
+                if saved:
+                    st.success(tr("Library Upload Result").format(count=len(saved)))
+                if failures:
+                    st.error(
+                        tr("Library Upload Failed").format(errors="；".join(failures))
+                    )
+                if saved or failures:
+                    st.rerun()
+
+    search_key = localized_widget_key("ml_admin_search")
+    kind_filter_key = localized_widget_key("ml_admin_kind")
+    keyword = st.session_state.get(search_key, "")
+    kind = st.session_state.get(kind_filter_key, "")
+
+    # 翻译文案必须在创建控件之前算好：format_func 会在控件状态重建时被再次调用，
+    # 那一刻不在脚本上下文里，读 st.session_state 会直接抛错。
+    all_kinds_label = tr("Library Filter All Kinds")
+    kind_labels = {
+        "": all_kinds_label,
+        **{
+            item["id"]: media_library.kind_label(item["id"], ui_language)
+            for item in media_library.KINDS
+        },
+    }
+
+    materials = media_library.list_materials(keyword=keyword, kind=kind)
+    rows = _material_table_rows(materials, ui_language)
+
+    if not materials:
+        st.info(tr("Library No Materials"))
+        return
+
+    if len(materials) > LIBRARY_PREVIEW_LIMIT:
+        st.caption(
+            tr("Library Preview Limit").format(
+                total=len(materials), shown=LIBRARY_PREVIEW_LIMIT
+            )
+        )
+
+    def _edit_material(row):
+        _material_detail_dialog(row["record"], ui_language)
+
+    def _delete_material(row):
+        media_library.delete_material(row["record"]["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_materials(selected_rows):
+        for row in selected_rows:
+            try:
+                media_library.delete_material(row["record"]["id"])
+            except (OSError, ValueError):
+                st.session_state.setdefault(
+                    "ml_admin_bulk_skipped", []
+                ).append(row["record"]["display_name"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
+        "ml",
+        rows,
+        [
+            AdminColumn(
+                key="preview",
+                label=tr("Library Col Preview"),
+                ratio=1.0,
+                render=lambda r: r["preview"],
+                image=True,
+            ),
+            AdminColumn(
+                key="name",
+                label=tr("Library Col Name"),
+                ratio=1.6,
+            ),
+            AdminColumn(
+                key="kind",
+                label=tr("Library Col Kind"),
+                ratio=0.8,
+            ),
+            AdminColumn(
+                key="spec",
+                label=tr("Library Col Spec"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="size",
+                label=tr("Library Col Size"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="status",
+                label=tr("Library Col Status"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="created_at",
+                label=tr("Library Col Created"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="remark",
+                label=tr("Library Col Remark"),
+                ratio=2.0,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Library Edit"),
+                icon=":material/edit:",
+                callback=_edit_material,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Library Delete"),
+                icon=":material/delete:",
+                callback=_delete_material,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_materials,
+            ),
+        ],
+        toolbar_search_label=tr("Library Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Library Filter Kind"),
+                options=[""] + list(media_library.KIND_IDS),
+                default="",
+                key=kind_filter_key,
+                format_func=lambda value, labels=kind_labels: labels.get(value, value),
+            ),
+        ],
+        empty_message=tr("Library No Materials"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
+    )
+
+    if st.session_state.pop("ml_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
+
+
+@st.dialog(tr("Script Library Detail Title"), width="large", on_dismiss=_close_record_dialog)
+def _script_detail_dialog(entry):
+    """文案详情弹窗：看全文、复制，或直接填入生成表单。"""
+    task_id = entry["task_id"]
+    st.markdown(f"**{entry['subject']}**")
+
+    meta_parts = [
+        tr("Script Library Chars").format(count=entry["char_count"]),
+        str(entry["generated_at"]).replace("T", " ")[:16],
+        tr("Script Library Has Video")
+        if entry["has_video"]
+        else tr("Script Library No Video"),
+    ]
+    if entry["video_source"]:
+        meta_parts.append(entry["video_source"])
+    if entry["voice_name"]:
+        meta_parts.append(entry["voice_name"])
+    st.caption("　·　".join(meta_parts))
+
+    # st.code 自带复制按钮，既当全文预览也当「复制文案」入口。
+    st.code(entry["script"], language=None)
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        fill_only = st.button(
+            tr("Script Library Fill Form"),
+            key=f"sl_fill_{task_id}",
+            width="stretch",
+        )
+    with action_cols[1]:
+        fill_and_run = st.button(
+            tr("Script Library Fill And Generate"),
+            key=f"sl_run_{task_id}",
+            type="primary",
+            width="stretch",
+        )
+
+    if fill_only or fill_and_run:
+        params = script_library.build_form_params(task_id)
+        if not params:
+            st.error(tr("Script Library Gone"))
+            return
+        # 只回填主题/文案/关键词：其余配置保留用户当前表单里的选择。
+        st.session_state["pending_form_params"] = params
+        st.session_state["pending_form_autostart"] = bool(fill_and_run)
+        st.session_state["pending_form_message"] = "Script Library Form Filled"
+        st.switch_page(_registered_page("generate"))
+
+    _close_dialog_button(f"sl_detail_close_{task_id}")
+
+
+def _script_table_rows(entries):
+    """把文案列表整理成表格数据。"""
+    return [
+        {
+            "subject": entry["subject"],
+            "char_count": entry["char_count"],
+            "has_video": tr("Script Library Has Video")
+            if entry["has_video"]
+            else tr("Script Library No Video"),
+            "generated_at": str(entry["generated_at"]).replace("T", " ")[:16],
+            "task_id": entry["task_id"],
+            "record": entry,
+        }
+        for entry in entries
+    ]
+
+
+def _render_script_library_page():
+    """脚本库页：检索已经生成过的文案，复用到新的生成任务里。"""
+    _render_top_bar()
+
+    if st.session_state.get("settings_dialog_open", False):
+        _render_settings_dialog()
+
+    st.subheader(tr("Script Library Title"))
+    st.caption(tr("Script Library Help"))
+
+    stats = script_library.summary()
+    metric_cols = st.columns(3)
+    metric_cols[0].metric(tr("Script Stat Scripts"), stats["scripts"])
+    metric_cols[1].metric(tr("Script Stat Characters"), stats["characters"])
+    metric_cols[2].metric(tr("Script Stat Videos"), stats["with_video"])
+
+    search_key = localized_widget_key("sl_admin_search")
+    only_with_video_key = localized_widget_key("sl_admin_only_video")
+    keyword = st.session_state.get(search_key, "")
+    only_with_video = bool(st.session_state.get(only_with_video_key, False))
+
+    entries = script_library.list_scripts(
+        keyword=keyword, only_with_video=only_with_video
+    )
+    rows = _script_table_rows(entries)
+
+    if not entries:
+        st.info(tr("Script Library Empty"))
+        return
+
+    def _edit_script(row):
+        _script_detail_dialog(row["record"])
+
+    def _delete_script(row):
+        script_library.delete_script(row["record"]["task_id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_scripts(selected_rows):
+        for row in selected_rows:
+            try:
+                script_library.delete_script(row["record"]["task_id"])
+            except (OSError, ValueError):
+                st.session_state.setdefault(
+                    "sl_admin_bulk_skipped", []
+                ).append(row["record"]["subject"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
+        "sl",
+        rows,
+        [
+            AdminColumn(
+                key="subject",
+                label=tr("Script Col Subject"),
+                ratio=2.5,
+            ),
+            AdminColumn(
+                key="char_count",
+                label=tr("Script Col Chars"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="has_video",
+                label=tr("Script Col Has Video"),
+                ratio=0.8,
+            ),
+            AdminColumn(
+                key="generated_at",
+                label=tr("Script Col Generated"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="task_id",
+                label=tr("Script Col Task Id"),
+                ratio=1.0,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Script Library Edit"),
+                icon=":material/edit:",
+                callback=_edit_script,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Script Library Delete"),
+                icon=":material/delete:",
+                callback=_delete_script,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_scripts,
+            ),
+        ],
+        toolbar_search_label=tr("Script Library Search"),
+        toolbar_search_key=search_key,
+        empty_message=tr("Script Library Empty"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
+    )
+
+    # "仅含视频" 是布尔筛选，与 admin_table 的 selectbox 风格筛选不一致；
+    # 放在工具栏搜索框右侧，留一行独立 checkbox 而非塞进 toolbar。
+    st.checkbox(
+        tr("Script Library Only With Video"),
+        key=only_with_video_key,
+    )
+
+    if st.session_state.pop("sl_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
+
+
+# 本次运行注册的页面对象，按 url_path 索引。st.switch_page 不支持按路径跳转
+# callable 页面，因此跨页跳转统一通过这里取 st.Page 实例。
+_PAGE_REGISTRY = {}
+
+
+def _registered_page(url_path):
+    """取出本次运行登记过的页面对象，供 st.switch_page 跨页跳转使用。
+
+    st.switch_page 只接受文件路径或 st.Page 对象；本项目所有页面都是 callable，
+    按路径跳转会报「Could not find page」。因此必须回传 st.navigation 注册过的
+    那个实例，这里统一从 _PAGE_REGISTRY 里取。
+    """
+    page = _PAGE_REGISTRY.get(url_path)
+    if page is None:
+        raise RuntimeError(f"page not registered for switch_page: {url_path}")
+    return page
+
+
+def _render_navigation():
+    """全局侧边导航栏：选题工坊 / 视频生成 / 素材库 / 脚本库 / 发布管理 / 账号管理。
+
+    导航放在侧边栏而不是顶部：Streamlit 的顶部导航会与页面自身的品牌栏争抢
+    头部空间，窄屏下会把条目折叠进溢出菜单。侧边栏是 Streamlit 多页应用的
+    标准位置，条目、图标和选中态都有稳定表现。
+
+    选题工坊是生成流程的前置步骤，因此排在首位并作为默认落地页；素材库和脚本库
+    承接生成过程中沉淀下来的本地素材与文案，排在生成页之后；发布管理与账号管理
+    是产出之后的运营环节。
+    """
+    pages = [
+        st.Page(
+            _render_topic_studio_page,
+            title=tr("Nav Topic Studio"),
+            icon=":material/lightbulb:",
+            url_path="topic-studio",
+            default=True,
+        ),
+        st.Page(
+            _render_application,
+            title=tr("Nav Generate"),
+            icon=":material/movie:",
+            url_path="generate",
+        ),
+        st.Page(
+            _render_media_library_page,
+            title=tr("Nav Media Library"),
+            icon=":material/perm_media:",
+            url_path="media-library",
+        ),
+        st.Page(
+            _render_script_library_page,
+            title=tr("Nav Script Library"),
+            icon=":material/description:",
+            url_path="script-library",
+        ),
+        st.Page(
+            _render_publish_board_page,
+            title=tr("Nav Publish Board"),
+            icon=":material/campaign:",
+            url_path="publish-board",
+        ),
+        st.Page(
+            _render_accounts_page,
+            title=tr("Nav Accounts"),
+            icon=":material/group:",
+            url_path="accounts",
+        ),
+    ]
+    # 每次运行都会重建页面对象，跳转必须用本次注册的那一批，因此这里同步刷新
+    # 登记表。st.Page 的 script hash 由 url_path 决定，所以按 url_path 索引稳定。
+    _PAGE_REGISTRY.clear()
+    _PAGE_REGISTRY.update({page.url_path: page for page in pages})
+    st.navigation(pages, position="sidebar").run()
+
+
+def _render_topic_studio_page():
+    """选题工坊页：让 AI 出选题方案，选中后填入表单并跳到视频生成页。"""
+    _render_top_bar()
+
+    # 选题工坊是默认落地页，顶部栏的设置按钮在这里也要能打开弹窗，否则首屏
+    # 点击设置没有任何反馈。
+    if st.session_state.get("settings_dialog_open", False):
+        _render_settings_dialog()
+
+    _render_topic_studio()
+
+
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
     _render_top_bar()
@@ -8375,7 +10596,7 @@ def _render_application():
         _render_settings_dialog()
 
     if _apply_pending_settings_preset():
-        st.success(tr("Settings Preset Imported"))
+        _show_flash(tr("Settings Preset Imported"))
 
     restore_applied = _apply_pending_task_restore()
     restore_candidate_id = st.session_state.get("task_restore_candidate_id")
@@ -8383,7 +10604,14 @@ def _render_application():
         _render_task_restore_dialog(restore_candidate_id)
     restore_succeeded = st.session_state.pop("task_restore_succeeded", False)
     if restore_applied or restore_succeeded:
-        st.success(tr("Task Configuration Loaded"))
+        _show_flash(tr("Task Configuration Loaded"))
+
+    # 选题工坊和脚本库都是独立页面，选中内容后跳转过来。它们的填充必须早于
+    # 任何表单控件创建，因此和历史任务恢复并列放在顶部；三者写入同一批控件
+    # key，不会同时触发。
+    pending_message_key = _apply_pending_form_params()
+    if pending_message_key:
+        _show_flash(tr(pending_message_key))
 
     with st.container(key="main_settings_grid"):
         panel = st.columns(4)
@@ -8419,4 +10647,7 @@ def _render_application():
         _save_runtime_config()
 
 
-_render_application()
+if __name__ != "__main__":
+    pass  # 模块被 import 时不启动导航，避免副作用。
+else:
+    _render_navigation()
